@@ -34,31 +34,39 @@ def _zenrows_get(url: str, js_render: bool = True, wait: int = 2000) -> str:
     r.raise_for_status()
     return r.text
 
-
 def _search_product_api(sku: str) -> str | None:
     """
-    Zara'nın dahili arama API'sine direkt istek at.
-    Arama sonuçlarından productId alır.
+    Zara'nın dahili arama sayfasını ZenRows üzerinden alır,
+    __NEXT_DATA__ JSON'unu çözüp productId çıkarır.
     """
-    search_api = f"https://www.zara.com/tr/tr/search?searchTerm={requests.utils.quote(sku)}"
+    search_url = f"https://www.zara.com/tr/tr/search?searchTerm={requests.utils.quote(sku)}"
+
     try:
-        html = _zenrows_get(search_api, js_render=True, wait=3000)
+        html = _zenrows_get(search_url, js_render=True, wait=4000)
     except Exception:
         return None
 
-    # Zara artık sonuçları <script id="__NEXT_DATA__"> içinde JSON olarak saklıyor.
     soup = BeautifulSoup(html, "html.parser")
     data_script = soup.find("script", id="__NEXT_DATA__")
     if not data_script or not data_script.string:
         return None
 
-    text = data_script.string
-    match = re.search(r'"productId":"(\d+)"', text)
-    if not match:
+    try:
+        import json
+        json_data = json.loads(data_script.string)
+        # JSON içinde products listesi -> items -> productId
+        sections = json_data["props"]["pageProps"]["initialData"]["sections"]
+        for section in sections:
+            for product in section.get("products", []):
+                pid = product.get("id") or product.get("productId")
+                if pid:
+                    return f"https://www.zara.com/tr/tr/p{pid}.html"
+    except Exception as e:
+        print("parse error:", e)
         return None
 
-    product_id = match.group(1)
-    return f"https://www.zara.com/tr/tr/p{product_id}.html"
+    return None
+
 
 
 def _parse_in_stock_from_html(html: str) -> dict:
