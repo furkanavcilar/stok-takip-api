@@ -1,182 +1,150 @@
+# src/scrapers/zara.py
 import os
 import re
-import json
-import urllib.parse
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-)
-HEADERS = {"User-Agent": USER_AGENT}
-ZENROWS_KEY = os.getenv("ZENROWS_API_KEY", "").strip()
+load_dotenv()
 
-def check_stock_by_code(code: str):
+# ZenRows anahtarı Railway Variables'dan gelecek
+ZENROWS_APIKEY = os.getenv("ZENROWS_APIKEY")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36"
+}
+
+def _zenrows_get(url: str, js_render: bool = True, wait: int = 2000) -> str:
     """
-    Zara ürün kodu (productId) ile kontrol: ör. 20230010
+    ZenRows üzerinden (JS render'lı) HTML çek. Başarısız olursa normal GET'e düş.
+    ZenRows dashboard örneğinde param ismi 'js_render' olarak veriliyor.
     """
-    pid = re.sub(r"\D+", "", code)
-    url = f"https://www.zara.com/tr/tr/p{pid}.html"
-    return _check_stock(url, ref=code)
-
-def check_stock_by_sku(sku: str):
-    """
-    Zara SKU (ör. 0052/6310) ile kontrol. SKU'dan productId türetmeyi dener,
-    olmadıysa arama sayfasından /pXXXXXXXX.html linkini yakalar.
-    """
-    clean = re.sub(r"\D+", "", sku)  # 00526310
-    # 1) Doğrudan p{clean}.html dene
-    first_try = _check_stock(f"https://www.zara.com/tr/tr/p{clean}.html", ref=sku)
-    if first_try.get("ok"):
-        return first_try
-
-    # 2) Aramadan pXXXXXXXX.html yakala
-    pid = _find_product_id_from_search(sku)
-    if not pid:
-        return {"ok": False, "error": "Ürün bulunamadı (productId tespit edilemedi)"}
-
-    return _check_stock(f"https://www.zara.com/tr/tr/p{pid}.html", ref=sku)
-
-# ---------- helpers ----------
-
-def _fetch(url: str, use_zenrows_if_needed: bool = True):
-    """
-    URL'i getirir. 200 dönmez veya challenge/404 olursa ve ZENROWS_API_KEY varsa
-    aynı isteği ZenRows üzerinden dener.
-    """
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code == 200 and r.text:
-            return r
-        # Uygun değilse ZenRows deneyelim
-        if use_zenrows_if_needed and ZENROWS_KEY:
-            zr = _fetch_via_zenrows(url)
-            if zr is not None:
-                return zr
-        return r
-    except Exception:
-        if use_zenrows_if_needed and ZENROWS_KEY:
-            zr = _fetch_via_zenrows(url)
-            return zr
-        raise
-
-def _fetch_via_zenrows(url: str):
-    try:
-        zurl = (
-            "https://api.zenrows.com/v1/?"
-            + urllib.parse.urlencode(
-                {
-                    "apikey": ZENROWS_KEY,
-                    "url": url,
-                    # rendering genelde viewData’yı garanti ediyor
-                    "js_render": "true",
-                }
-            )
-        )
-        zr = requests.get(zurl, headers=HEADERS, timeout=25)
-        return zr
-    except Exception:
-        return None
-
-def _find_product_id_from_search(term: str) -> str | None:
-    """
-    Arama sayfasından ilk /pXXXXXXXX.html linkini yakalar.
-    """
-    q = urllib.parse.quote(term)
-    search_url = f"https://www.zara.com/tr/tr/search?searchTerm={q}"
-    r = _fetch(search_url)
-    if not r or r.status_code != 200:
-        return None
-
-    html = r.text
-    # 1) Doğrudan pXXXXXXXX.html desenini ara
-    m = re.search(r"/tr/tr/p(\d{6,12})\.html", html)
-    if m:
-        return m.group(1)
-
-    # 2) Bazı şablonlarda "productId":"12345678" geçer
-    m2 = re.search(r'"productId"\s*:\s*"(\d{6,12})"', html)
-    if m2:
-        return m2.group(1)
-
-    # 3) Sayfayı BeautifulSoup ile tara; linklerden yakala
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            hm = re.search(r"/tr/tr/p(\d{6,12})\.html", a["href"])
-            if hm:
-                return hm.group(1)
-    except Exception:
-        pass
-
-    return None
-
-def _extract_view_data(html: str) -> dict | None:
-    """
-    window.viewData = {...}; bloğunu JSON’a çevirir.
-    """
-    # En sağlamı: script blokları arasında 'viewData' geçen bloğu bulup JSON’u çekmek
-    soup = BeautifulSoup(html, "html.parser")
-    for script in soup.find_all("script"):
-        txt = script.string or script.text or ""
-        if "window.viewData" in txt:
-            m = re.search(r"window\.viewData\s*=\s*(\{.*?\});", txt, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(1))
-                except Exception:
-                    # Bazı durumlarda trailing commas vs. olabilir, ikinci deneme:
-                    cleaned = m.group(1)
-                    cleaned = re.sub(r",\s*}", "}", cleaned)
-                    cleaned = re.sub(r",\s*]", "]", cleaned)
-                    return json.loads(cleaned)
-    # Regex ile tüm sayfada son çare:
-    m2 = re.search(r"window\.viewData\s*=\s*(\{.*?\});", html, re.DOTALL)
-    if m2:
-        try:
-            return json.loads(m2.group(1))
-        except Exception:
-            pass
-    return None
-
-def _check_stock(product_url: str, ref: str):
-    """
-    Ürün sayfasını çekip viewData’dan varyant/availability çıkarır.
-    """
-    try:
-        resp = _fetch(product_url)
-        if not resp or resp.status_code != 200:
-            return {
-                "ok": False,
-                "error": f"Ürün bulunamadı (HTTP {getattr(resp, 'status_code', '??')})",
-                "url": product_url,
-            }
-
-        data = _extract_view_data(resp.text)
-        if not data:
-            return {"ok": False, "error": "viewData bulunamadı", "url": product_url}
-
-        variants = []
-        product_detail = data.get("product", {}).get("detail", [])
-        for prod in product_detail:
-            color = prod.get("colorName")
-            for size in prod.get("sizes", []):
-                variants.append(
-                    {
-                        "color": color,
-                        "size": size.get("name"),
-                        "availability": size.get("availability"),
-                    }
-                )
-
-        in_stock = any(v.get("availability") == "in_stock" for v in variants)
-        return {
-            "ok": True,
-            "in_stock": in_stock,
-            "searched": ref,
-            "url": product_url,
-            "variants": variants,
+    if ZENROWS_APIKEY:
+        api = "https://api.zenrows.com/v1/"
+        params = {
+            "apikey": ZENROWS_APIKEY,
+            "url": url,
+            "js_render": "true" if js_render else "false",
+            "wait": str(wait),
         }
+        try:
+            r = requests.get(api, params=params, headers=HEADERS, timeout=40)
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            pass  # fallback
+
+    # fallback: normal request
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def _find_product_url_from_search(sku: str) -> str | None:
+    """
+    Zara TR aramasından SKU'ya uygun ürün sayfasını bul.
+    Çoğu sayfada ürün linkleri /pXXXXXXXX.html ile gider.
+    """
+    search_url = f"https://www.zara.com/tr/tr/search?searchTerm={requests.utils.quote(sku)}"
+    html = _zenrows_get(search_url, js_render=True, wait=2500)
+    soup = BeautifulSoup(html, "html.parser")
+
+    # /p########.html kalıplı link ara
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"/p\d+\.html", href):
+            if href.startswith("http"):
+                return href
+            return "https://www.zara.com" + href
+    return None
+
+
+def _parse_in_stock_from_html(html: str) -> dict:
+    """
+    Heuristik: sayfadaki script/text içinden stok var mı yok mu anlamaya çalış.
+    Mümkün olduğunca 'in_stock', 'availability', 'add to bag' gibi ipuçlarını tarar.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True).lower()
+
+    # Script bloklarında stok/availability sinyali ara
+    for s in soup.find_all("script"):
+        content = s.string or ""
+        if not isinstance(content, str):
+            continue
+        lc = content.lower()
+
+        # Pozitif sinyal
+        if '"in_stock":true' in lc or '"in_stock": true' in lc:
+            return {"ok": True, "in_stock": True}
+        if '"availability":"in stock"' in lc or '"availability":"available"' in lc:
+            return {"ok": True, "in_stock": True}
+
+        # Negatif sinyal
+        if '"in_stock":false' in lc or '"in_stock": false' in lc:
+            return {"ok": True, "in_stock": False}
+        if '"availability":"out of stock"' in lc or '"availability":"unavailable"' in lc:
+            return {"ok": True, "in_stock": False}
+
+    # Metin üzerindeki ipuçları
+    neg_words = ["stokta yok", "tükendi", "out of stock", "ürün bulunamadı"]
+    if any(w in text for w in neg_words):
+        return {"ok": True, "in_stock": False}
+
+    pos_words = ["sepete ekle", "add to bag", "add to cart", "stoğa eklendi"]
+    if any(w in text for w in pos_words):
+        return {"ok": True, "in_stock": True}
+
+    # kesin değil
+    return {"ok": False, "in_stock": None, "error": "stok durum belirsiz"}
+
+
+def check_stock_by_sku(sku: str) -> dict:
+    sku = (sku or "").strip()
+    if not sku:
+        return {"ok": False, "error": "SKU boş"}
+
+    product_url = _find_product_url_from_search(sku)
+    if not product_url:
+        return {"ok": False, "error": "Ürün bulunamadı (search ile p*.html linki bulunamadı)", "searched_sku": sku}
+
+    try:
+        html = _zenrows_get(product_url, js_render=True, wait=2500)
+    except requests.HTTPError as e:
+        return {"ok": False, "error": f"HTTP hata: {e}", "url": product_url, "searched_sku": sku}
     except Exception as e:
-        return {"ok": False, "error": str(e), "url": product_url}
+        return {"ok": False, "error": f"İndirme hatası: {e}", "url": product_url, "searched_sku": sku}
+
+    parsed = _parse_in_stock_from_html(html)
+    parsed["url"] = product_url
+    parsed["searched_sku"] = sku
+    return parsed
+
+
+def check_stock_by_code(code: str) -> dict:
+    """
+    Eğer direkt ürün kodun varsa (p########.html gibi) doğrudan sayfaya gitmeyi dene.
+    """
+    code = (code or "").strip()
+    # code "00526310" gibi ise pXXXX.html kalıbına çevir:
+    # emin değilsen önce search'ten dene:
+    if not re.fullmatch(r"\d{6,}", code):
+        # Kod temiz değilse önce search
+        return check_stock_by_sku(code)
+
+    candidates = [
+        f"https://www.zara.com/tr/tr/p{code}.html",
+        f"https://www.zara.com/p{code}.html",
+    ]
+    last_err = None
+    for url in candidates:
+        try:
+            html = _zenrows_get(url, js_render=True, wait=2500)
+            parsed = _parse_in_stock_from_html(html)
+            parsed["url"] = url
+            parsed["searched_code"] = code
+            return parsed
+        except Exception as e:
+            last_err = e
+            continue
+    return {"ok": False, "error": f"Ürün bulunamadı veya erişilemedi: {last_err}", "searched_code": code}
