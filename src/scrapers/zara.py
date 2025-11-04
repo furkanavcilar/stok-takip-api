@@ -1,141 +1,57 @@
-# src/scrapers/zara.py
-import os
-import re
-import json
-import time
-from typing import Dict, Any, Optional
-
 import requests
+from bs4 import BeautifulSoup
+import re
 
-
-def _fetch(url: str) -> str:
+def check_stock_by_code(code: str):
     """
-    HTML getir. ZENROWS_API_KEY varsa ZenRows üzerinden, yoksa direkt istek at.
+    Zara ürün kodu ile stok bilgisini kontrol eder (örnek: 20230010)
     """
-    zenrows_key = os.getenv("ZENROWS_API_KEY", "").strip()
-    headers = {
-        # Basit bir tarayıcı gibi görünelim
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
+    url = f"https://www.zara.com/tr/tr/p{code}.html"
+    return _check_stock(url, code)
 
-    if zenrows_key:
-        api = "https://api.zenrows.com/v1/"
-        params = {
-            "apikey": zenrows_key,
-            "url": url,
-            # JS render Zara için çoğu durumda gerekli değil, ama hazır dursun
-            "js_render": "false",
-        }
-        r = requests.get(api, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        return r.text
-
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.text
-
-
-def _extract_viewdata(html: str) -> Optional[Dict[str, Any]]:
+def check_stock_by_sku(sku: str):
     """
-    window.zara.viewData = {...}; bloğunu çıkar ve JSON'a çevir.
-    Farklı minify biçimlerine karşı esnek regex.
+    Zara ürün SKU (örnek: 0052/6310) ile stok bilgisini kontrol eder
     """
-    # ; ile biten tek satırlık atamalar için esnek bir regex
-    m = re.search(
-        r"window\.zara\.viewData\s*=\s*(\{.*?\})\s*;",
-        html,
-        re.DOTALL,
-    )
-    if not m:
-        return None
-    raw = m.group(1)
+    clean = sku.replace("/", "").replace("-", "")
+    url = f"https://www.zara.com/tr/tr/p{clean}.html"
+    return _check_stock(url, sku)
 
-    # bazen trailing virgüller vb. olabiliyor; önce doğrudan dene
+def _check_stock(url: str, ref: str):
     try:
-        return json.loads(raw)
-    except Exception:
-        # JSON temizlemeye küçük bir deneme daha
-        cleaned = re.sub(r",\s*}", "}", raw)
-        cleaned = re.sub(r",\s*]", "]", cleaned)
-        return json.loads(cleaned)
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if resp.status_code != 200:
+            return {"ok": False, "error": f"Ürün bulunamadı (HTTP {resp.status_code})", "url": url}
 
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-def _decide_stock(data: Dict[str, Any]) -> Optional[bool]:
-    """
-    viewData içinden varyantları bul ve availability durumuna göre stok var/yok kararı ver.
-    True/False döner; bulamazsak None.
-    """
-    try:
-        product = data["product"]["detail"]
-        colors = product.get("colors", [])
-        sizes_accum = []
+        # Zara sayfalarında 'viewData' JSON'u var
+        match = re.search(r"window\.viewData\s*=\s*(\{.*?\});", resp.text)
+        if not match:
+            return {"ok": False, "error": "viewData bulunamadı", "url": url}
 
-        for c in colors:
-            # renklerin altındaki beden listeleri
-            sizes = c.get("sizes") or []
-            sizes_accum.extend(sizes)
+        import json
+        data = json.loads(match.group(1))
 
-        if not sizes_accum:
-            return None
+        # Stok durumunu ara
+        stock_info = []
+        for product in data.get("product", {}).get("detail", []):
+            color = product.get("colorName")
+            for size in product.get("sizes", []):
+                stock_info.append({
+                    "color": color,
+                    "size": size.get("name"),
+                    "availability": size.get("availability"),
+                })
 
-        # availability alanı genelde: "in_stock", "out_of_stock", "coming_soon"
-        for s in sizes_accum:
-            availability = (s.get("availability") or "").lower()
-            # stok varsa direkt True
-            if availability in ("in_stock", "low_stock", "back_soon", "coming_soon"):
-                return True
-
-        # hiçbiri stokta değilse:
-        return False
-    except Exception:
-        return None
-
-
-def normalize_sku_to_pid(sku: str) -> str:
-    """
-    '0052/6310' -> '00526310'
-    """
-    return re.sub(r"[^\d]", "", sku).strip()
-
-
-def check_stock(sku: str) -> Dict[str, Any]:
-    """
-    Dışarıya açık fonksiyon: SKU alır, URL oluşturur, HTML'i çeker ve stok durumunu döndürür.
-    """
-    product_id = normalize_sku_to_pid(sku)
-    url = f"https://www.zara.com/tr/tr/-p{product_id}.html"
-
-    try:
-        html = _fetch(url)
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"istek hatası: {e}",
-            "url": url,
-            "product_id": product_id,
-            "searched_sku": sku,
-        }
-
-    view = _extract_viewdata(html)
-    if not view:
+        in_stock = any(s["availability"] == "in_stock" for s in stock_info)
         return {
             "ok": True,
-            "in_stock": None,
-            "error": "viewData bulunamadı",
+            "in_stock": in_stock,
             "url": url,
-            "product_id": product_id,
-            "searched_sku": sku,
+            "searched": ref,
+            "variants": stock_info
         }
 
-    in_stock = _decide_stock(view)
-    return {
-        "ok": True,
-        "in_stock": in_stock,  # True / False / None
-        "url": url,
-        "product_id": product_id,
-        "searched_sku": sku,
-    }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "url": url}
