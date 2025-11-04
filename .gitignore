@@ -1,0 +1,13 @@
+﻿# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Env
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
